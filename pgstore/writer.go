@@ -12,8 +12,6 @@ import (
 	"github.com/go-pg/pg/v9/orm"
 )
 
-const batch_size = 10
-
 var _ spanstore.Writer = (*Writer)(nil)
 var _ io.Closer = (*Writer)(nil)
 
@@ -23,8 +21,6 @@ type Writer struct {
 	spanMeasurement     string
 	spanMetaMeasurement string
 	logMeasurement      string
-	counter				int
-	batch				[]*model.Span
 
 	// Points as line protocol
 	//writeCh chan string
@@ -39,7 +35,6 @@ func NewWriter(db *pg.DB, logger hclog.Logger) *Writer {
 		db: db,
 		//writeCh: make(chan string),
 		logger: logger,
-		batch: make([]*model.Span, 0, batch_size)
 	}
 
 	db.CreateTable(&Service{}, &orm.CreateTableOptions{})
@@ -77,44 +72,27 @@ func (w *Writer) WriteSpan(span *model.Span) error {
 		OnConflict("(operation_name) DO NOTHING").Returning("id").Limit(1).SelectOrInsert(); err != nil {
 		return err
 	}
-
-	if w.counter != batch_size {
-		batch[w.counter] = span
-		w.counter++
-	} else {
-		err = w.db.RunInTransaction(w.writebatch)
-		if err != nil {
-			return err
-		}
-		w.counter = 0
+	if _, err := w.db.Model(&Span{
+		ID:          span.SpanID,
+		TraceIDLow:  span.TraceID.Low,
+		TraceIDHigh: span.TraceID.High,
+		OperationID: operation.ID,
+		Flags:       span.Flags,
+		StartTime:   span.StartTime,
+		Duration:    span.Duration,
+		Tags:        mapModelKV(span.Tags),
+		ServiceID:   service.ID,
+		ProcessID:   span.ProcessID,
+		ProcessTags: mapModelKV(span.Process.Tags),
+		Warnings:    span.Warnings,
+	}).OnConflict("(id) DO UPDATE").Insert(); err != nil {
+		return err
 	}
 
+	insertRefs(w.db, span)
+	insertLogs(w.db, span)
 
 	return nil
-}
-
-func (w *writer) writeBatch() error {
-	for _, span := range w.batch {
-		if _, err := w.db.Model(&Span{
-			ID:          span.SpanID,
-			TraceIDLow:  span.TraceID.Low,
-			TraceIDHigh: span.TraceID.High,
-			OperationID: operation.ID,
-			Flags:       span.Flags,
-			StartTime:   span.StartTime,
-			Duration:    span.Duration,
-			Tags:        mapModelKV(span.Tags),
-			ServiceID:   service.ID,
-			ProcessID:   span.ProcessID,
-			ProcessTags: mapModelKV(span.Process.Tags),
-			Warnings:    span.Warnings,
-		}).OnConflict("(id) DO UPDATE").Insert(); err != nil {
-			return err
-		}
-	
-		insertRefs(w.db, span)
-		insertLogs(w.db, span)
-	}
 }
 
 func insertLogs(db *pg.DB, input *model.Span) (ret []*Log, err error) {
